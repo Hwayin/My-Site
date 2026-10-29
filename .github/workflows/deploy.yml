@@ -1,0 +1,146 @@
+name: Build & Deploy
+
+# 触发方式：
+#   1) push 到 main 分支 —— 自动构建并发布
+#   2) 手动 Actions 页面点 "Run workflow"
+on:
+  push:
+    branches: [main]
+    # 只改文档时不触发部署
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: site
+  NODE_VERSION: '20'
+  REMOTE_WEB: /var/www/site
+  REMOTE_APP: /opt/site
+
+# 同一分支只保留最新一次部署，避免并发 rsync 打架
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 构建前端 + 打包后端
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            backend/package-lock.json
+
+      - name: 安装前端依赖
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: 构建前端静态文件
+        working-directory: frontend
+        run: npm run build
+
+      - name: 安装后端依赖
+        working-directory: backend
+        run: npm ci --no-audit --no-fund
+
+      - name: 打包后端为单文件（服务器无需 npm install）
+        working-directory: backend
+        run: npm run build
+
+      - name: 生成版本信息
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const v = {
+              sha: process.env.GITHUB_SHA,
+              short: process.env.GITHUB_SHA.slice(0, 7),
+              ref: process.env.GITHUB_REF_NAME,
+              message: (process.env.COMMIT_MSG || "").split("\n")[0].slice(0, 200),
+              runNumber: process.env.GITHUB_RUN_NUMBER,
+              builtAt: new Date().toISOString(),
+              deployedAt: null,
+            };
+            fs.writeFileSync("frontend/dist/version.json", JSON.stringify(v, null, 2));
+            fs.writeFileSync("VERSION", JSON.stringify(v, null, 2));
+          '
+          echo "--- VERSION ---"
+          cat VERSION
+          echo "--- dist ---"
+          ls -lh frontend/dist
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-build
+          path: |
+            frontend/dist
+            backend/dist
+            VERSION
+          retention-days: 3
+          if-no-files-found: error
+
+  deploy:
+    name: 发布到服务器
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: site-build
+          path: artifact
+
+      - name: 配置 SSH 私钥
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: 记录主机指纹
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          echo "known_hosts:"; tail -n 2 ~/.ssh/known_hosts
+
+      - name: 同步前端与后端产物
+        run: |
+          RSYNC_SSH="ssh -p $SSH_PORT -o StrictHostKeyChecking=yes -o ConnectTimeout=15"
+          echo "== 前端 -> $REMOTE_WEB =="
+          rsync -az --delete -e "$RSYNC_SSH" artifact/frontend/dist/ "$SSH_USER@$SSH_HOST:$REMOTE_WEB/"
+          echo "== 后端 -> $REMOTE_APP/backend/dist =="
+          rsync -az --delete -e "$RSYNC_SSH" artifact/backend/dist/ "$SSH_USER@$SSH_HOST:$REMOTE_APP/backend/dist/"
+
+      - name: 写入版本文件并重启服务
+        run: |
+          RSYNC_SSH="ssh -p $SSH_PORT -o StrictHostKeyChecking=yes -o ConnectTimeout=15"
+          # 先同步 VERSION（此时 deployedAt 还是 null）
+          rsync -az -e "$RSYNC_SSH" artifact/VERSION "$SSH_USER@$SSH_HOST:$REMOTE_APP/VERSION"
+          # 在服务器上补上发布时间，再重启 API
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" \
+            "node -e \"const fs=require('fs');const p='$REMOTE_APP/VERSION';const v=JSON.parse(fs.readFileSync(p));v.deployedAt=new Date().toISOString();fs.writeFileSync(p,JSON.stringify(v,null,2));\" && sudo /usr/bin/systemctl restart ${APP_NAME}-api && sleep 2 && sudo /usr/bin/systemctl is-active ${APP_NAME}-api"
+
+      - name: 发布后健康检查
+        run: |
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" \
+            "curl -fsS --max-time 10 http://127.0.0.1/api/health && echo && curl -fsS --max-time 10 http://127.0.0.1/api/version"
